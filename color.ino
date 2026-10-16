@@ -1,60 +1,80 @@
-#include <Adafruit_TCS34725.h> // カラーセンサライブラリのヘッダーファイル
-Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_2_4MS, TCS34725_GAIN_60X);
+#include <Adafruit_TCS34725.h>
+#include "ColorSensor.h"
+Adafruit_TCS34725 tcs(TCS34725_INTEGRATIONTIME_2_4MS, TCS34725_GAIN_16X);
+static float references[4][3]; // black, white, red, blue; current field/lighting only.
+static bool calibrated = false;
 
-unsigned int r_min, g_min, b_min; // このグローバル変数はこのファイル内のみで使用
-unsigned int r_max, g_max, b_max;
+bool colorBegin() { return tcs.begin(); }
 
-void  CalibrationColorSensor()
-{
-  unsigned long timeInit;
-  uint16_t r, g, b, clr;
-
-  tcs.begin(); // カラーセンサーのsetup
-  
-  motors.setSpeeds(60, 60); 
-
-  r_min = 30000;
-  g_min = 30000;
-  b_min = 30000;
-  r_max = 0;
-  g_max = 0;
-  b_max = 0;
-
-  timeInit = millis();
-
-  while (1) 
-  {
-    tcs.getRawData(&r, &g, &b, &clr); // rowdataの取得
-  
-    if (r < r_min) r_min = r;
-    if (g < g_min) g_min = g;
-    if (b < b_min) b_min = b;
-    if (r > r_max) r_max = r;
-    if (g > g_max) g_max = g;
-    if (b > b_max) b_max = b;
-
-    if (millis() - timeInit > 2000)
-      break;
-  }
-  
-  motors.setSpeeds(0, 0);
+static bool rawColor(float *rgb) {
+  // Renesas Wire has no getWireTimeoutFlag(); test the TCS34725 ACK explicitly.
+  Wire.beginTransmission(0x29);
+  if (Wire.endTransmission() != 0) return false;
+  uint16_t r, g, b, clear;
+  tcs.getRawData(&r, &g, &b, &clear);
+  // 2.4 ms integration saturates at 1024 counts, not 65535.
+  if (clear == 0 || clear >= 1024 || r >= 1024 || g >= 1024 || b >= 1024) return false;
+  rgb[0] = r; rgb[1] = g; rgb[2] = b;
+  return true;
 }
 
+bool colorCalibrate() {
+  calibrated = false;
+  for (uint8_t surface = 0; surface < 4; ++surface) {
+    Serial.print(F("Place sensor on: "));
+    switch (surface) {
+      case 0: Serial.println(F("BLACK, then press/release button")); break;
+      case 1: Serial.println(F("WHITE, then press/release button")); break;
+      case 2: Serial.println(F("RED, then press/release button")); break;
+      case 3: Serial.println(F("BLUE, then press/release button")); break;
+    }
+    button.waitForButton();
+    for (uint8_t channel = 0; channel < 3; ++channel) references[surface][channel] = 0;
+    for (uint8_t sample = 0; sample < 20; ++sample) {
+      float rgb[3];
+      if (!rawColor(rgb)) return false;
+      for (uint8_t channel = 0; channel < 3; ++channel)
+        references[surface][channel] += rgb[channel] / 20.0f;
+      delay(5); // Calibration only; no moving motors.
+    }
+  }
+  for (uint8_t channel = 0; channel < 3; ++channel)
+    if (references[1][channel] - references[0][channel] < 25) return false;
+  // Reject indistinguishable calibration surfaces.
+  for (uint8_t a = 0; a < 4; ++a) for (uint8_t b = a + 1; b < 4; ++b) {
+    float distance = 0;
+    for (uint8_t channel = 0; channel < 3; ++channel) {
+      float d = (references[a][channel] - references[b][channel]) /
+                (references[1][channel] - references[0][channel]);
+      distance += d * d;
+    }
+    if (distance < 0.12f) return false;
+  }
+  calibrated = true;
+  return true;
+}
 
-void getRGB(float& r0, float& g0, float& b0) 
-{
-  uint16_t r, g, b, clr;
-
-  tcs.getRawData(&r, &g, &b, &clr); // rowdataの取得
- 
-  r0 = map(r, r_min, r_max, 0, 255);
-  g0 = map(g, g_min, g_max, 0, 255);
-  b0 = map(b, b_min, b_max, 0, 255);
-
-  if (r0 < 0.0) r0 = 0.0;
-  if (r0 > 255.0) r0 = 255.0;
-  if (g0 < 0.0) g0 = 0.0;
-  if (g0 > 255.0) g0 = 255.0;
-  if (b0 < 0.0) b0 = 0.0;
-  if (b0 > 255.0) b0 = 255.0;
+bool colorRead(contest::Floor &floor) {
+  floor = contest::UNKNOWN;
+  float rgb[3];
+  if (!calibrated || !rawColor(rgb)) return false;
+#if defined(WIRE_HAS_TIMEOUT)
+  if (Wire.getWireTimeoutFlag()) { Wire.clearWireTimeoutFlag(); return false; }
+#endif
+  float best = 1000000, second = 1000000;
+  uint8_t closest = 0;
+  for (uint8_t surface = 0; surface < 4; ++surface) {
+    float distance = 0;
+    for (uint8_t channel = 0; channel < 3; ++channel) {
+      float d = (rgb[channel] - references[surface][channel]) /
+                (references[1][channel] - references[0][channel]);
+      distance += d * d;
+    }
+    if (distance < best) { second = best; best = distance; closest = surface; }
+    else if (distance < second) second = distance;
+  }
+  if (best > 0.30f || second - best < 0.04f) return true; // Mixed/unknown: controller stops.
+  const contest::Floor labels[] = {contest::BLACK, contest::WHITE, contest::RED, contest::BLUE};
+  floor = labels[closest];
+  return true;
 }
